@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.env
+
+# Models / checkpoints (download separately, ~1.3GB each)
+*.pth
+*.pt
+
+# Generated calibration boards (not code)
+*.png
+*.jpg
+# But keep config and calibration JSONs
+!config.json
+!camera_intrinsics.json
+!camera_extrinsics.json
+
+# Output from pipeline runs
+output/
+
+# System
+.DS_Store
+Thumbs.db

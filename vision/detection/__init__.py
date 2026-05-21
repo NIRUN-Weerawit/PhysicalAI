@@ -1,0 +1,1 @@
+from .grounded_sam2_wrapper import GroundedSAM2Wrapper
