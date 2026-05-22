@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """
-isaacsim_live_detection.py — Grounded SAM 2 + Depth Anything in Isaac Sim
+isaacsim_live_detection.py — Grounded SAM 2 + Simulated RGB-D in Isaac Sim
 =============================================================================
 
-Runs the PhysicalAI detection pipeline (Grounded SAM 2 → Depth Anything V2 → 3D
+Runs the PhysicalAI detection pipeline (Grounded SAM 2 → sim depth → 3D
 projection → ObjectDB) inside an NVIDIA Isaac Sim simulation using the same
 Franka Panda scene from rdt_panda_single.py.
 
+Unlike the real-camera live_detection.py, this script gets **perfect metric
+depth** directly from Isaac Sim's Camera.get_depth() — no monocular depth
+estimation needed.
+
 Camera images are captured from Isaac Sim's synthetic RGB cameras (not a
-webcam).  Detection outputs are overlaid on the simulation view, displayed in
-OpenCV windows alongside top-down / side 3D projections, and logged to an
-ObjectDB.
+webcam).  Detection outputs are overlaid on the camera image, 3D positions are
+projected using the sim's ground-truth depth buffer, displayed as saved frames,
+and logged to an ObjectDB.
 
 USAGE
 -----
@@ -20,19 +24,19 @@ Must be run inside Isaac Sim's Python environment::
     ./python.sh ~/PhysicalAI/scripts/isaacsim_live_detection.py
 
 Isaac Sim uses Python 3.10 + its own bundled numpy/opencv.  The PhysicalAI
-dependencies (pycocotools, supervision) need to be pip-installed WITHOUT
-upgrading numpy.  If you broke numpy already::
+dependencies (pycocotools, supervision, iopath) need to be installed::
 
     ./python.sh -m pip install 'numpy<2' --force-reinstall
     ./python.sh -m pip install pycocotools supervision --no-deps
+    ./python.sh -m pip install iopath
 
 Then re-run.
 
-KEY DIFFERENCES vs live_detection.py (real webcam)
----------------------------------------------------
+KEY DIFFERENCES vs live_detection.py (real webcam + Depth Anything)
+-------------------------------------------------------------------
 - Camera source: Isaac Sim Camera sensor → RGBA tensor, not OpenCV VideoCapture.
-- No real-time FPS constraint: simulation is stepped manually.
-- Depth comes from Depth Anything V2 (same monocular estimator), NOT sim depth.
+- Depth source: **Simulated ground truth** via Camera.get_depth(), NOT monocular.
+- 3D positions are accurate to millimeters (perfect sim depth).
 - Robot is present in the scene but NOT controlled — it stays at the initial
   pose so you can detect objects around it.
 - Scene objects (cubes, rubik's, etc.) are randomised each run.
@@ -43,7 +47,7 @@ KEY CONFIGURATION
   DETECT_INTERVAL : run Grounding DINO every N frames (5 = ~every 5th sim step)
   camera          : primary detection camera (mid_rgb_cam by default)
   camera_freq     : capture frequency in simulation Hz
-  resolution      : 720 x 480 (must match calibration in config.json)
+  resolution      : 1280 x 720
 
   Scene cameras:
     - mid_rgb_cam   (/World/Realsense_mid/)   — overhead view (default)
@@ -56,30 +60,30 @@ import sys
 import os
 import json
 import time
+import math
 import numpy as np
 import cv2
 import torch
 import warnings
 
 # ── PhysicalAI pipeline modules ────────────────────────────────────────────
-PHYSICALAI_ROOT = os.path.expanduser("~/PhysicalAI")
+PHYSICALAI_ROOT = "/home/ucluser/PhysicalAI"
 sys.path.insert(0, PHYSICALAI_ROOT)
 sys.path.insert(0, os.path.join(PHYSICALAI_ROOT, "Grounded-SAM-2"))
 
-# supervision's annotation tools need numpy < 2 — try our best
 try:
     import supervision as sv
     HAS_SV = True
 except ImportError:
     HAS_SV = False
-    print("[WARN] supervision not available — install via `./python.sh -m pip install supervision --no-deps`")
+    print("[WARN] supervision not available")
 
 from vision.configs.config import load_vision_config
 from vision.detection.grounded_sam2_wrapper import GroundedSAM2Wrapper
-from vision.depth_estimation.depth_anything_wrapper import DepthAnythingWrapper
 from vision.world_model.object_db import ObjectDB, ObjectRecord
 
 warnings.filterwarnings("ignore", message=".*has been deprecated.*")
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Simulation setup
@@ -95,25 +99,15 @@ from isaacsim.core.utils.prims import get_prim_at_path
 from isaacsim.core.utils.stage import open_stage
 from isaacsim.core.utils.viewports import set_camera_view
 from isaacsim.sensors.camera import Camera
-from isaacsim.core.utils.extensions import enable_extension
 from pxr import UsdPhysics
 
-# simulation_app.set_setting("/app/window/drawMouse", True)
-# enable_extension("omni.kit.livestream.webrtc")
+simulation_app.set_setting("/app/window/drawMouse", True)
 
 np.random.seed(42)
 torch.manual_seed(42)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(42)
     torch.cuda.manual_seed_all(42)
-    
-warnings.filterwarnings(
-    "ignore",
-    message=".*has been deprecated.*",
-)
-torch.cuda.empty_cache()
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-
 
 # ── Scene ──────────────────────────────────────────────────────────────────
 USD_PATH = "/home/ucluser/isaacgym/assets/urdf/piper_description/urdf/piper_description/franka_simple_1.usd"
@@ -127,7 +121,7 @@ set_camera_view(eye=[2.0, 0.0, 4.0], target=[0.0, 0.0, 2.5])
 # ── Resolution & frequency ────────────────────────────────────────────────
 WIDTH  = 1280
 HEIGHT = 720
-FREQ   = 20  # capture Hz
+FREQ   = 20
 
 # ── Robot (loaded but not controlled) ──────────────────────────────────────
 robot = SingleArticulation("/World/franka")
@@ -173,8 +167,9 @@ CAM_NAME    = "mid"
 
 base.initialize()
 franka_hand.initialize()
-# body_rgb_cam.initialize()
 mid_rgb_cam.initialize()
+# Only init the camera we use; skip others to save resources
+# body_rgb_cam.initialize()
 # left_rgb_cam.initialize()
 # right_rgb_cam.initialize()
 
@@ -194,7 +189,8 @@ robot.set_joint_positions(np.array([
     0.0, -0.93, 0.0, -2.43, 0.0, 2.25, 0.86,
     0.0, 0.0,
 ]))
-sim.step(render=True)
+for _ in range(5):
+    sim.step(render=True)
 print("Robot initial pose set")
 
 # ── Randomise object positions ─────────────────────────────────────────────
@@ -217,7 +213,6 @@ for obj_name, obj_prim in objects.items():
     pos, q = random_pose()
     obj_prim.set_world_pose(position=pos, orientation=q)
 print("Object positions randomised")
-
 for _ in range(10):
     sim.step(render=True)
 
@@ -228,25 +223,18 @@ cfg = load_vision_config(
     path=os.path.join(PHYSICALAI_ROOT, "config.json"),
     depth_source="depth_anything",
 )
-# Calibrated intrinsics — update after ChArUco calibration inside sim
+# Intrinsics for 3D projection (calibrated or from sim camera)
 cfg.fx = 805.859
 cfg.fy = 782.398
 cfg.cx = 657.854
 cfg.cy = 362.74
 
-TEXT_PROMPT = "black cube. purple box. rubik's cube. nvidia cube. robotic arm. gripper. table. shelf. cart."
+TEXT_PROMPT = "cube. box. rubik's cube. nvidia cube. bottle. can. ball. sphere."
 DETECT_INTERVAL = 5
 
-print("Loading detection models...")
+print("Loading Grounded SAM 2 (detection only — depth from sim)...")
 detector = GroundedSAM2Wrapper(cfg)
-depth_estimator = DepthAnythingWrapper(
-    encoder=cfg.depth_anything_encoder,
-    checkpoint_path=cfg.depth_anything_checkpoint,
-    device=cfg.device,
-    grayscale=cfg.depth_anything_grayscale,
-    fx=cfg.fx, fy=cfg.fy, cx=cfg.cx, cy=cfg.cy,
-)
-print("Models loaded.")
+print("Models loaded.\n")
 
 # ── ObjectDB ───────────────────────────────────────────────────────────────
 db = ObjectDB(stale_timeout=3.0)
@@ -255,30 +243,27 @@ fx, fy, cx, cy = cfg.fx, cfg.fy, cfg.cx, cfg.cy
 
 # ── Display ────────────────────────────────────────────────────────────────
 VIEW_RANGE = 3.0
-# 3D view panel: half width for each panel, total width matches camera frame
 VIEW_SIZE_H = min(WIDTH // 2, 640)
 PPM         = VIEW_SIZE_H / VIEW_RANGE
 
 frame_count = 0
 detections  = []
-depth_map   = np.zeros((HEIGHT, WIDTH), dtype=np.float32)
 
 FPS_WINDOW = 1.0
 fps_start  = time.perf_counter()
 fps_count  = 0
 fps_display = 0.0
 
-# ── Output directory for debug frames ──
+# ── Output directory ──
 OUTPUT_DIR = os.path.join(PHYSICALAI_ROOT, "output", f"isaac_sim_{CAM_NAME}")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
-SAVE_EVERY = 10  # save a display frame every N sim steps
-LOG_EVERY = 30   # print console status every N sim steps
-
-# ── Run for this many steps (Ctrl+C to quit early) ──
+SAVE_EVERY = 10
+LOG_EVERY = 30
 MAX_STEPS = 5000
 
-print("\n=== ISAAC SIM LIVE DETECTION ===")
+print("\n=== ISAAC SIM LIVE DETECTION (RGB-D) ===")
 print(f"Camera: {CAM_NAME}  Resolution: {WIDTH}x{HEIGHT}")
+print(f"Depth source: Camera.get_depth()  (ground truth)")
 print(f"Prompt: {TEXT_PROMPT}")
 print(f"Output frames: {OUTPUT_DIR}/frame_*.jpg (every {SAVE_EVERY} steps)")
 print(f"Max steps: {MAX_STEPS}  (Ctrl+C to exit early)\n")
@@ -293,17 +278,21 @@ try:
         is_detect = (frame_count % DETECT_INTERVAL == 0)
         now = time.monotonic()
 
-        # ── Capture frame from Isaac Sim camera ──
+        # ── Capture RGB from Isaac Sim camera ──
         rgba = PRIMARY_CAM.get_rgba()
         if len(rgba) == 0:
             continue
-        # Isaac Sim returns flat RGBA, reshape to HxWx4
         color_image = rgba.copy().reshape((HEIGHT, WIDTH, 4))
         frame_bgr = cv2.cvtColor(color_image[:, :, :3], cv2.COLOR_RGB2BGR)
         h, w = frame_bgr.shape[:2]
 
-        # ── Depth estimation ──
-        depth_map = depth_estimator.estimate(frame_bgr)
+        # ── Capture DEPTH from Isaac Sim camera ──
+        # get_depth() returns flat float32 array in meters.
+        # NaN / inf / 0 means no valid return (sky, far clipping).
+        depth_flat = PRIMARY_CAM.get_depth()
+        if len(depth_flat) == 0:
+            continue
+        depth_map = depth_flat.copy().reshape((HEIGHT, WIDTH)).astype(np.float32)
 
         # ── Detection ──
         if is_detect:
@@ -312,14 +301,17 @@ try:
 
             for r in detections:
                 u, v = r["centroid_2d"]
+                # Sample depth at centroid (3x3 median for robustness)
                 try:
-                    patch = depth_map[max(0,v-3):min(h,v+4), max(0,u-3):min(w,u+4)]
-                    valid = patch[patch > 0.001]
+                    patch = depth_map[max(0,v-1):min(h,v+2), max(0,u-1):min(w,u+2)]
+                    valid = patch[(patch > 0.001) & (~np.isnan(patch)) & (~np.isinf(patch))]
                     d = float(np.median(valid)) if len(valid) > 0 else 0.0
                 except Exception:
                     d = 0.0
 
                 if d > 0.001:
+                    # 3D projection (OpenCV camera frame)
+                    # x=right, y=forward(depth), z=up
                     x_w = (u - cx) * d / fx
                     y_w = d
                     z_w = -(v - cy) * d / fy
@@ -363,7 +355,7 @@ try:
                     db.remove(obj.object_id)
 
         # ═══════════════════════════════════════════════════════════════════
-        # OpenCV display
+        # OpenCV display (rendered to numpy, saved to disk)
         # ═══════════════════════════════════════════════════════════════════
         display = frame_bgr.copy()
 
@@ -384,7 +376,7 @@ try:
         # ── 3D Dual-view panel ──
         v3d = np.zeros((VIEW_SIZE_H, VIEW_SIZE_H * 2, 3), dtype=np.uint8)
         cv2.rectangle(v3d, (0, 0), (VIEW_SIZE_H*2-1, VIEW_SIZE_H-1), (25, 25, 35), -1)
-        cv2.putText(v3d, f"TOP-DOWN (x->  y^)  Camera: {CAM_NAME}", (10, 20),
+        cv2.putText(v3d, f"TOP-DOWN (x->  y^)  Camera: {CAM_NAME}  [RGB-D]", (10, 20),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 180), 1)
         cv2.putText(v3d, f"SIDE (y->  z^)  R={VIEW_RANGE}m", (VIEW_SIZE_H + 10, 20),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 180), 1)
@@ -447,12 +439,15 @@ try:
             fps_start = time.perf_counter()
 
         tag = " [DETECT]" if is_detect else ""
-        cv2.putText(display, f"FPS: {fps_display:.1f} | Objects: {len(detections)}{tag}",
+
+        cv2.putText(display,
+                    f"FPS: {fps_display:.1f} | Objs: {len(detections)}{tag}",
                     (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        cv2.putText(display, f"Isaac Sim | Camera: {CAM_NAME} | Step: {frame_count}",
+        cv2.putText(display,
+                    f"Isaac Sim RGB-D | Camera: {CAM_NAME} | Step: {frame_count}",
                     (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
 
-        # ── Save or log — no cv2.imshow (Isaac Sim's OpenCV has no GUI) ──
+        # ── Save (no cv2.imshow — Isaac Sim's OpenCV has no GUI) ──
         if frame_count % SAVE_EVERY == 0:
             combined = np.vstack([display, v3d])
             out_path = os.path.join(OUTPUT_DIR, f"frame_{frame_count:06d}.jpg")
@@ -461,9 +456,11 @@ try:
         if frame_count % LOG_EVERY == 0:
             n_objects = len(detections)
             n_db = len(db.get_all())
+            d_min = float(np.nanmin(depth_map)) if not np.all(np.isnan(depth_map)) else 0
+            d_max = float(np.nanmax(depth_map[depth_map < 1e6])) if not np.all(np.isnan(depth_map)) else 0
             print(f"[step {frame_count}] FPS={fps_display:.1f}  "
-                  f"detected={n_objects}  db_objects={n_db}  "
-                  f"prompt={TEXT_PROMPT[:30]}...")
+                  f"detected={n_objects}  db={n_db}  "
+                  f"depth_range=[{d_min:.2f}, {d_max:.2f}]m")
 
 except KeyboardInterrupt:
     pass
