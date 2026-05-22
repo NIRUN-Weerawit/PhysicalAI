@@ -97,13 +97,23 @@ class GroundedSAM2Wrapper:
             outputs = self.grounding_model(**inputs)
 
         # Post-process: returns list of dicts (one per image in batch)
-        results_hf = self.processor.post_process_grounded_object_detection(
-            outputs,
-            inputs.input_ids,
-            threshold=self.cfg.box_threshold,
-            text_threshold=self.cfg.text_threshold,
-            target_sizes=[(h, w)],
-        )[0]
+        # transformers v4.49+ changed 'threshold' → 'box_threshold'
+        try:
+            results_hf = self.processor.post_process_grounded_object_detection(
+                outputs,
+                inputs.input_ids,
+                threshold=self.cfg.box_threshold,
+                text_threshold=self.cfg.text_threshold,
+                target_sizes=[(h, w)],
+            )[0]
+        except TypeError:
+            results_hf = self.processor.post_process_grounded_object_detection(
+                outputs,
+                inputs.input_ids,
+                box_threshold=self.cfg.box_threshold,
+                text_threshold=self.cfg.text_threshold,
+                target_sizes=[(h, w)],
+            )[0]
 
         if len(results_hf["boxes"]) == 0:
             return []
