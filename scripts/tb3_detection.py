@@ -265,7 +265,11 @@ class TB3DetectionNode(Node):
                 f"conf={info['confidence']:.2f}  "
                 f"seen={info['observation_count']}x")
         rclpy.shutdown()
-        cv2.destroyAllWindows()
+        if self.has_gui:
+            try:
+                cv2.destroyAllWindows()
+            except cv2.error:
+                pass
 
 
 def main():
