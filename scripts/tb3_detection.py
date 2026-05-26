@@ -59,6 +59,7 @@ class TB3DetectionNode(Node):
         self.detections = []
         self.rgb_received = False
         self.depth_received = False
+        self._rgb_first_time = 0.0
 
         self.db = ObjectDB(stale_timeout=3.0)
         self.seen_this_cycle = set()
@@ -87,7 +88,7 @@ class TB3DetectionNode(Node):
         self.has_gui = not HEADLESS
         if self.has_gui:
             try:
-                blank = np.zeros((480, 640, 3), dtype=np.uint8)
+                blank = np.zeros((1080, 1920, 3), dtype=np.uint8)
                 cv2.putText(blank, "Waiting for camera...", (100, 240),
                             cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
                 cv2.imshow("TB3 Detection", blank)
@@ -115,6 +116,7 @@ class TB3DetectionNode(Node):
             self.latest_rgb = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
             if not self.rgb_received:
                 self.rgb_received = True
+                self._rgb_first_time = time.monotonic()
                 self._log(
                     f"First RGB frame: {self.latest_rgb.shape[1]}x{self.latest_rgb.shape[0]}")
         except Exception as e:
@@ -135,8 +137,20 @@ class TB3DetectionNode(Node):
             self._log(f"Depth callback error: {e}")
 
     def process(self):
-        if self.latest_rgb is None or self.latest_depth is None:
+        if self.latest_rgb is None:
             return
+
+        # Warn if depth never arrived after 5 seconds of RGB
+        if self.latest_depth is None:
+            if self.rgb_received and time.monotonic() - self._rgb_first_time > 5.0:
+                if not hasattr(self, '_warned_no_depth'):
+                    self._warned_no_depth = True
+                    self._log("WARNING: No depth topic received. "
+                              "Running RGB-only — 3D positions unavailable.")
+            # Continue processing anyway — just without depth
+            depth_map = None
+        else:
+            depth_map = self.latest_depth.copy().astype(np.float32)
 
         if self.first_frame_time is None:
             self.first_frame_time = time.perf_counter()
@@ -157,14 +171,16 @@ class TB3DetectionNode(Node):
 
             for r in self.detections:
                 u, v = r["centroid_2d"]
-                try:
-                    patch = depth_map[max(0, v - 1):min(h, v + 2),
-                                      max(0, u - 1):min(w, u + 2)]
-                    valid = patch[(patch > 0.001) & (~np.isnan(patch)) &
-                                  (~np.isinf(patch))]
-                    d = float(np.median(valid)) if len(valid) > 0 else 0.0
-                except Exception:
-                    d = 0.0
+                d = 0.0
+                if depth_map is not None:
+                    try:
+                        patch = depth_map[max(0, v - 1):min(h, v + 2),
+                                          max(0, u - 1):min(w, u + 2)]
+                        valid = patch[(patch > 0.001) & (~np.isnan(patch)) &
+                                      (~np.isinf(patch))]
+                        d = float(np.median(valid)) if len(valid) > 0 else 0.0
+                    except Exception:
+                        pass
 
                 if d > 0.001:
                     r["_px"] = (u - cx) * d / fx
