@@ -82,14 +82,22 @@ class TB3DetectionNode(Node):
         self._log(f"Subscribed to /camera/rgb/image_raw, /camera/depth/image_raw")
         self._log(f"Prompt: {TEXT_PROMPT}")
         self._log(f"Output: {self.output_dir}/")
-        self._log(f"Headless: {HEADLESS}")
 
-        if not HEADLESS:
-            blank = np.zeros((480, 640, 3), dtype=np.uint8)
-            cv2.putText(blank, "Waiting for camera...", (100, 240),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
-            cv2.imshow("TB3 Detection", blank)
-            cv2.waitKey(1)
+        # Detect whether OpenCV actually supports GUI
+        self.has_gui = not HEADLESS
+        if self.has_gui:
+            try:
+                blank = np.zeros((480, 640, 3), dtype=np.uint8)
+                cv2.putText(blank, "Waiting for camera...", (100, 240),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+                cv2.imshow("TB3 Detection", blank)
+                cv2.waitKey(1)
+            except cv2.error:
+                self.has_gui = False
+                self._log("OpenCV has no GUI support — running headless, "
+                          "frames saved to disk.")
+
+        self._log(f"Headless: {not self.has_gui}")
 
     def _log(self, msg):
         self.get_logger().info(msg)
@@ -232,7 +240,7 @@ class TB3DetectionNode(Node):
                     (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.4,
                     (200, 200, 200), 1)
 
-        if not HEADLESS:
+        if self.has_gui:
             cv2.imshow("TB3 Detection", display)
             key = cv2.waitKey(1) & 0xFF
             if key in (ord('q'), 27):
