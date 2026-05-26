@@ -103,7 +103,7 @@ class TB3DetectionNode(Node):
         self.get_logger().info(msg)
 
     def info_callback(self, msg: CameraInfo):
-        if not self.intrinsics_received and msg.k:
+        if not self.intrinsics_received and len(msg.k) >= 9:
             self.fx, self.fy = float(msg.k[0]), float(msg.k[4])
             self.cx, self.cy = float(msg.k[2]), float(msg.k[5])
             self.intrinsics_received = True
