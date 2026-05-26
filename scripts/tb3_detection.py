@@ -52,6 +52,27 @@ class TB3DetectionNode(Node):
         self.detector = GroundedSAM2Wrapper(cfg)
         self._log("Model loaded.")
 
+        # Load Depth Anything V2 (used as fallback if no depth topic)
+        from vision.depth_estimation.depth_anything_wrapper import DepthAnythingWrapper
+        self._log("Loading Depth Anything V2 (fallback depth)...")
+        self.depth_estimator = DepthAnythingWrapper(
+            encoder="vits",  # smaller, faster — ~55ms/frame
+            checkpoint_path=os.path.join(
+                PHYSICALAI_ROOT,
+                "depth_anything_v2",
+                "checkpoints",
+                "depth_anything_v2_vits.pth"
+            ),
+            device="cuda",
+            config_path=os.path.join(
+                PHYSICALAI_ROOT,
+                "depth_anything_v2",
+                "depth_anything_v2/dinov2/configs/depth_anything_v2/vits.yaml"
+            ),
+            physicalai_root=PHYSICALAI_ROOT
+        )
+        self._log("Depth Anything V2 loaded.")
+
         self.bridge = CvBridge()
         self.latest_rgb = None
         self.latest_depth = None
@@ -140,30 +161,37 @@ class TB3DetectionNode(Node):
         if self.latest_rgb is None:
             return
 
-        # Warn if depth never arrived after 5 seconds of RGB
-        if self.latest_depth is None:
-            if self.rgb_received and time.monotonic() - self._rgb_first_time > 5.0:
-                if not hasattr(self, '_warned_no_depth'):
-                    self._warned_no_depth = True
-                    self._log("WARNING: No depth topic received. "
-                              "Running RGB-only — 3D positions unavailable.")
-            # Continue processing anyway — just without depth
-            depth_map = None
-        else:
-            depth_map = self.latest_depth.copy().astype(np.float32)
-
-        if self.first_frame_time is None:
-            self.first_frame_time = time.perf_counter()
-            self._log("First processing frame — starting detection loop.")
-
         frame_bgr = self.latest_rgb.copy()
-        depth_map = self.latest_depth.copy().astype(np.float32)
         h, w = frame_bgr.shape[:2]
         fx, fy, cx, cy = self.fx, self.fy, self.cx, self.cy
 
         self.frame_count += 1
         is_detect = (self.frame_count % DETECT_INTERVAL == 0)
         now = time.monotonic()
+
+        # Decide depth source
+        if self.latest_depth is None:
+            # No depth topic — fall back to monocular estimation
+            if self.rgb_received and time.monotonic() - self._rgb_first_time > 5.0:
+                if not hasattr(self, '_warned_no_depth'):
+                    self._warned_no_depth = True
+                    self._log(
+                        "WARNING: No depth topic received. "
+                        "Falling back to Depth Anything V2 (monocular estimation).")
+            if is_detect:
+                try:
+                    depth_map = self.depth_estimator.estimate(frame_bgr)
+                except Exception as e:
+                    self._log(f"Depth Anything estimate failed: {e}")
+                    depth_map = None
+            else:
+                depth_map = None
+        else:
+            depth_map = self.latest_depth.copy().astype(np.float32)
+
+        if self.first_frame_time is None:
+            self.first_frame_time = time.perf_counter()
+            self._log("First processing frame — starting detection loop.")
 
         if is_detect:
             self.detections = self.detector.detect(TEXT_PROMPT, frame_bgr)
