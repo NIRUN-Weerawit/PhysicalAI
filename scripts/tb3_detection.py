@@ -32,7 +32,7 @@ from rclpy.node import Node
 from sensor_msgs.msg import Image, CameraInfo
 from cv_bridge import CvBridge
 
-TEXT_PROMPT = "fire hydrant. stop sign. person. chair. book. bottle. cup. box."
+TEXT_PROMPT = "sphere. shelf. table. chair. human. man. woman. box."
 DETECT_INTERVAL = 5
 HEADLESS = not os.environ.get("DISPLAY")
 
@@ -56,7 +56,7 @@ class TB3DetectionNode(Node):
         from vision.depth_estimation.depth_anything_wrapper import DepthAnythingWrapper
         self._log("Loading Depth Anything V2 (fallback depth)...")
         self.depth_estimator = DepthAnythingWrapper(
-            encoder="vits",  # smaller, faster — ~55ms/frame
+            encoder="vits",
             checkpoint_path=os.path.join(
                 PHYSICALAI_ROOT,
                 "depth_anything_v2",
@@ -64,12 +64,7 @@ class TB3DetectionNode(Node):
                 "depth_anything_v2_vits.pth"
             ),
             device="cuda",
-            config_path=os.path.join(
-                PHYSICALAI_ROOT,
-                "depth_anything_v2",
-                "depth_anything_v2/dinov2/configs/depth_anything_v2/vits.yaml"
-            ),
-            physicalai_root=PHYSICALAI_ROOT
+            fx=self.fx, fy=self.fy, cx=self.cx, cy=self.cy,
         )
         self._log("Depth Anything V2 loaded.")
 
@@ -86,11 +81,11 @@ class TB3DetectionNode(Node):
         self.seen_this_cycle = set()
 
         self.rgb_sub = self.create_subscription(
-            Image, "/camera/rgb/image_raw", self.rgb_callback, 10)
+            Image, "/oakd/rgb/preview/image_raw", self.rgb_callback, 10)
         self.depth_sub = self.create_subscription(
-            Image, "/camera/depth/image_raw", self.depth_callback, 10)
+            Image, "/oakd/rgb/preview/depth", self.depth_callback, 10)
         self.info_sub = self.create_subscription(
-            CameraInfo, "/camera/rgb/camera_info", self.info_callback, 10)
+            CameraInfo, "/oakd/rgb/preview/camera_info", self.info_callback, 10)
 
         self.create_timer(0.1, self.process)
 
@@ -109,7 +104,7 @@ class TB3DetectionNode(Node):
         self.has_gui = not HEADLESS
         if self.has_gui:
             try:
-                blank = np.zeros((1080, 1920, 3), dtype=np.uint8)
+                blank = np.zeros((240, 320, 3), dtype=np.uint8)
                 cv2.putText(blank, "Waiting for camera...", (100, 240),
                             cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
                 cv2.imshow("TB3 Detection", blank)
@@ -292,7 +287,7 @@ class TB3DetectionNode(Node):
                 rclpy.shutdown()
                 return
 
-        if self.frame_count % 30 == 0:
+        if self.frame_count % 10 == 0:
             p = os.path.join(self.output_dir,
                              f"frame_{self.frame_count:06d}.jpg")
             cv2.imwrite(p, display)
