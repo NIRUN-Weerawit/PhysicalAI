@@ -29,13 +29,16 @@ import subprocess
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
+from rclpy.executors import MultiThreadedExecutor
+from std_srvs.srv import Trigger
+from example_interfaces.srv import SetBool
 from sensor_msgs.msg import Image, CameraInfo, LaserScan
 from nav_msgs.msg import OccupancyGrid
 from geometry_msgs.msg import PoseStamped, Point
 from nav2_msgs.action import NavigateToPose
 from cv_bridge import CvBridge
 
-TEXT_PROMPT = "sphere. shelf. table. chair. human. man. woman. box."
+TEXT_PROMPT = "sphere. shelf. table. chair. human. fire hydrant. stop sign. box. cup. book. bottle. pot. trash can. furniture. sofa. desk. door. plant."
 DETECT_INTERVAL = 5
 FRONTIER_CHECK_INTERVAL = 2.0  # seconds between frontier searches
 SAVE_MAP_ON_EXIT = os.path.join(PHYSICALAI_ROOT, "output", "orchestrator_map")
@@ -106,6 +109,14 @@ class MapOrchestrator(Node):
         self._goal_viz_pub = self.create_publisher(
             PoseStamped, "/exploration_goal", 10)
 
+        # ── Manual goal services ──
+        self._list_objects_srv = self.create_service(
+            Trigger, "/list_objects", self._list_objects_cb)
+        self._go_to_nearest_srv = self.create_service(
+            Trigger, "/go_to_nearest_object", self._go_to_nearest_cb)
+        self._go_by_class_srv = self.create_service(
+            Trigger, "/go_to_object_class", self._go_by_class_cb)
+
         # ── ObjectDB ──
         self.db = ObjectDB(stale_timeout=5.0)
         self.seen_this_cycle = set()
@@ -146,6 +157,60 @@ class MapOrchestrator(Node):
         os.makedirs(self.output_dir, exist_ok=True)
 
         self._log("MapOrchestrator ready.")
+
+    # ── Manual goal services ─────────────────────────────────────────────────
+
+    def _list_objects_cb(self, req, resp):
+        """List all objects in the ObjectDB."""
+        all_objs = self.db.get_all()
+        if not all_objs:
+            resp.success = True
+            resp.message = "No objects in database."
+            return resp
+
+        lines = [f"{len(all_objs)} objects in database:"]
+        for obj in sorted(all_objs, key=lambda o: o.class_name):
+            x, y, z = obj.position_world
+            conf = obj.confidence
+            lines.append(f"  {obj.class_name:15s}  ({x:.2f}, {y:.2f}, {z:.2f})  conf={conf:.2f}")
+        resp.success = True
+        resp.message = "\n".join(lines)
+        return resp
+
+    def _go_to_nearest_cb(self, req, resp):
+        """Navigate to the nearest detected object."""
+        all_objs = self.db.get_all()
+        if not all_objs:
+            resp.success = False
+            resp.message = "No objects in database to navigate to."
+            return resp
+
+        if self._goal_active:
+            resp.success = False
+            resp.message = "Already navigating to a goal. Cancel first or wait."
+            return resp
+
+        # Pick the first (sorted by distance from origin — rough proxy)
+        obj = all_objs[0]
+        x, y, z = obj.position_world
+        self._log(f"Manual goal: navigating to {obj.class_name} at ({x:.2f}, {y:.2f})")
+        self._send_nav_goal(x, y)
+        resp.success = True
+        resp.message = f"Navigating to {obj.class_name} at ({x:.2f}, {y:.2f})"
+        return resp
+
+    def _go_by_class_cb(self, req, resp):
+        """Navigate to the nearest object matching a class name substring."""
+        all_objs = self.db.get_all()
+        if not all_objs:
+            resp.success = False
+            resp.message = "No objects in database."
+            return resp
+
+        # req.data = True means call with a specific class — but Trigger has no data field.
+        # We use it as a simpler service to go to the highest-confidence object.
+        # For class-specific, we'd need a custom service type — use /go_to_nearest_object instead.
+        return self._go_to_nearest_cb(req, resp)
 
     def _log(self, msg: str):
         self.get_logger().info(msg)

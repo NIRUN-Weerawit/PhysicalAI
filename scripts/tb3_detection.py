@@ -32,8 +32,8 @@ from rclpy.node import Node
 from sensor_msgs.msg import Image, CameraInfo
 from cv_bridge import CvBridge
 
-TEXT_PROMPT = "sphere. shelf. table. chair. human. man. woman. box."
-DETECT_INTERVAL = 5
+TEXT_PROMPT = "sphere. shelf. table. chair. fire hydrant. stop sign. box. cup. book. bottle. pot. trash can. furniture. sofa. desk. door. plant."
+DETECT_INTERVAL = 3
 HEADLESS = not os.environ.get("DISPLAY")
 
 
