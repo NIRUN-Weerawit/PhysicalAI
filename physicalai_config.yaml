@@ -1,0 +1,56 @@
+# PhysicalAI — Configuration File
+# =================================
+# Edit this file to configure your LLM provider, Telegram bot, and robot settings.
+# The orchestrator reads this file on startup.
+#
+# LLM PROVIDER
+# The orchestrator supports two modes:
+#   1. Ollama (local) — set provider to "ollama" and api_base to your Ollama server URL
+#   2. OpenRouter (cloud) — set provider to "openrouter" and provide an api_key
+#
+# If both are set, api_base takes priority for non-empty keys.
+# If neither is configured, the system falls back to Ollama at http://localhost:11434
+#
+# TELEGRAM
+# To control the robot from Telegram:
+#   1. Create a bot via @BotFather on Telegram → get the token
+#   2. Find your chat ID (send a message to the bot, then visit
+#      https://api.telegram.org/bot<TOKEN>/getUpdates to find the chat_id)
+#   3. Fill in both fields below
+#
+# DETECTION PROMPT
+# Space-separated list of object classes Grounding DINO searches for.
+# Add or remove classes as needed for your environment.
+
+llm:
+  provider: "ollama"           # "ollama" or "openrouter"
+  model: "deepseek-v4-flash:cloud"  # model name to use
+  # model: "qwen3.6:latest"  # model name to use
+  api_base: "http://localhost:1196"  # Ollama server URL
+  api_key: ""                  # OpenRouter API key (if using openrouter)
+  temperature: 0.1             # LLM temperature (0.0-1.0)
+
+telegram:
+  bot_token: ""                # From @BotFather
+  chat_id: ""                  # Your Telegram user/group chat ID
+
+detection:
+  prompt: "sphere. shelf. table. chair. bed. human. fire hydrant. stop sign. box. cup. book. bottle. pot. trash can. furniture. sofa. desk. door. plant."
+  hf_token: ""                  # HuggingFace token for faster model downloads (get one at https://huggingface.co/settings/tokens)
+
+robot:
+  # Camera frame name for TF transforms. Write the frame name exactly as
+  # it appears in `ros2 topic echo /tf` — plain text, no quotes or slashes.
+  # Examples: camera_rgb_frame, camera_link, camera_rgb_optical_frame
+  # Leave empty (or omit) to auto-detect from common frame names.
+  # camera_frame: "camera_rgb_frame"
+  max_linear_speed: 3.0       # m/s — TB3 default, adjust for your platform
+  max_angular_speed: 2.0       # rad/s — TB3 default
+  max_depth: 10.0              # meters — maximum valid depth reading
+
+  # -- Object memory database --
+  # Objects persist for the entire run (or until explicitly forgotten via
+  # forget_object / forget_class / forget_all tools).
+  # Set persist_db to a file path to survive restarts:
+  # persist_db: "/home/ucluser/PhysicalAI/objects.db"
+  persist_db: ""               # empty = in-memory, objects lost on restart

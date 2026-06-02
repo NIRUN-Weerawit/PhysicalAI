@@ -5,6 +5,7 @@ import numpy as np
 import cv2
 import json
 import torch
+import os
 from pathlib import Path
 
 from .base import DepthEstimator
@@ -130,11 +131,11 @@ class DepthAnythingWrapper(DepthEstimator):
                 return np.zeros((h, w), dtype=np.float32)
             depth = inv * (3.0 / p95)
 
-        # DEBUG: print depth stats every 30th frame
+        # DEBUG: print depth stats every 30th frame (disabled by default)
         if not hasattr(self, '_dbg_ctr'):
             self._dbg_ctr = 0
         self._dbg_ctr += 1
-        if self._dbg_ctr % 30 == 0:
+        if self._dbg_ctr % 30 == 0 and os.environ.get("DEPTH_DEBUG"):
             p5, p50, p95_d = [float(np.percentile(depth, p)) for p in [5, 50, 95]]
             inv_p5, inv_p50, inv_p95 = [float(np.percentile(inv, p)) for p in [5, 50, 95]]
             import sys as _sys

@@ -19,9 +19,10 @@ sys.path.insert(0, os.path.join(PHYSICALAI_ROOT, "Grounded-SAM-2"))
 
 from vision.configs.config import load_vision_config
 from vision.detection.grounded_sam2_wrapper import GroundedSAM2Wrapper
-from vision.world_model.object_db import ObjectDB, ObjectRecord
+from vision.world_model.object_db import ObjectDB
 from orchestrator.launcher import NavLauncher
 from orchestrator.tf_bridge import TFBridge
+from orchestrator.drift_monitor import DriftMonitor
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
@@ -49,6 +50,7 @@ class MapOrchestrator(Node):
 
     def __init__(self):
         super().__init__("map_orchestrator")
+        self.set_parameters([rclpy.parameter.Parameter("use_sim_time", rclpy.parameter.Parameter.Type.BOOL, True)])
         self._log("MapOrchestrator starting...")
 
         # ── Config ──
@@ -86,11 +88,19 @@ class MapOrchestrator(Node):
         self.bridge = CvBridge()
         self.latest_rgb = None
         self.latest_depth = None
+        self.latest_scan = None
+        self.global_costmap = None
+        self.local_costmap = None
         self.rgb_received = False
         self.depth_received = False
         self._rgb_first_time = 0.0
         self.frame_count = 0
         self.detections = []
+
+        # ── Depth calibration ──
+        self._depth_scale = 1.0        # multiplicative correction for depth readings
+        self._depth_scale_raw = []     # raw correction samples for diagnostics
+        self._depth_scale_max_samples = 20  # EMA window
 
         # ── Subs ──
         self.rgb_sub = self.create_subscription(
@@ -101,6 +111,12 @@ class MapOrchestrator(Node):
             CameraInfo, "/camera/rgb/camera_info", self.info_callback, 10)
         self.map_sub = self.create_subscription(
             OccupancyGrid, "/map", self.map_callback, 10)
+        self.scan_sub = self.create_subscription(
+            LaserScan, "/scan", self.scan_callback, 10)
+        self.global_costmap_sub = self.create_subscription(
+            OccupancyGrid, "/global_costmap/costmap", self.global_costmap_callback, 10)
+        self.local_costmap_sub = self.create_subscription(
+            OccupancyGrid, "/local_costmap/costmap", self.local_costmap_callback, 10)
 
         # ── Nav2 action client ──
         self._nav_client = ActionClient(self, NavigateToPose, "navigate_to_pose")
@@ -118,7 +134,15 @@ class MapOrchestrator(Node):
             Trigger, "/go_to_object_class", self._go_by_class_cb)
 
         # ── ObjectDB ──
-        self.db = ObjectDB(stale_timeout=5.0)
+        self._embedder = None
+        # Persistence: env var set from physicalai_config.yaml
+        db_path = os.environ.get("PHYSICALAI_PERSIST_DB", "")
+        if db_path:
+            self.db = ObjectDB(embedder=None, db_path=db_path, persistence=True)
+            self._log(f"Object memory persisted to {db_path}")
+        else:
+            self.db = ObjectDB(embedder=None)
+            self._log("Object memory in-memory (no persistence)")
         self.seen_this_cycle = set()
         self._warned_no_depth = False
 
@@ -131,15 +155,18 @@ class MapOrchestrator(Node):
         self._goal_result_future = None
         self._start_time = time.monotonic()
 
+        # ── Drift monitoring (semantic loop closure) ──
+        self.drift_monitor = DriftMonitor(drift_threshold=0.3, min_observations=3)
+
+        # ── Safety monitor (reactive collision avoidance) ──
+        from orchestrator.safety_monitor import SafetyMonitor
+        self.safety = SafetyMonitor(self, forward_angle_deg=40.0, danger_distance_m=0.35)
+
         # ── Processing timer ──
         self.create_timer(0.1, self.process)
 
-        # ── Exploration timer (check every 3s for frontiers when idle) ──
-        self._exploring_enabled = False  # becomes True after init
-        self._goal_active = False
-        self._goal_handle = None
-        self._goal_result_future = None
-        self.create_timer(3.0, self.exploration_tick)
+        # ── Safety check timer (runs at 20Hz, faster than Nav2's control loop) ──
+        self.create_timer(0.05, self._safety_tick)
 
         # ── Launch SLAM + Nav2 ──
         self._nav = NavLauncher()
@@ -214,6 +241,20 @@ class MapOrchestrator(Node):
 
     def _log(self, msg: str):
         self.get_logger().info(msg)
+        # Push to dashboard
+        try:
+            from orchestrator.dashboard_server import push_log
+            push_log("info", msg)
+        except Exception:
+            pass
+
+    def _warn(self, msg: str):
+        self.get_logger().warn(msg)
+        try:
+            from orchestrator.dashboard_server import push_log
+            push_log("warn", msg)
+        except Exception:
+            pass
 
     # ── Callbacks ───────────────────────────────────────────────────────────
 
@@ -248,6 +289,24 @@ class MapOrchestrator(Node):
         with self.map_lock:
             self.current_map = msg
 
+    def scan_callback(self, msg: LaserScan):
+        self.latest_scan = msg
+        if hasattr(self, 'safety'):
+            self.safety.update_scan(msg)
+
+    def global_costmap_callback(self, msg: OccupancyGrid):
+        self.global_costmap = msg
+
+    def local_costmap_callback(self, msg: OccupancyGrid):
+        self.local_costmap = msg
+
+    # ── Safety monitor tick (20Hz) ──────────────────────────────────────
+
+    def _safety_tick(self):
+        """Run the safety monitor on a fast timer. Calls emergency stop via /cmd_vel."""
+        if hasattr(self, 'safety'):
+            self.safety.check()
+
     # ── Main process loop ──────────────────────────────────────────────────
 
     def process(self):
@@ -281,8 +340,19 @@ class MapOrchestrator(Node):
 
         # ── Detection ──
         if is_detect and depth_map is not None:
-            self.detections = self.detector.detect(TEXT_PROMPT, frame_bgr)
+            prompt = getattr(self, '_text_prompt', TEXT_PROMPT)
+            self.detections = self.detector.detect(prompt, frame_bgr)
             self.seen_this_cycle = set()
+
+            # Lazy-load embedder on first detection
+            if self._embedder is None:
+                try:
+                    from vision.reid.embedding_matcher import EmbeddingMatcher
+                    self._embedder = EmbeddingMatcher()
+                    self.db._embedder = self._embedder
+                    self._log("CLIP embedder loaded for object re-identification.")
+                except Exception as e:
+                    self._log(f"Embedder unavailable (re-ID disabled): {e}")
 
             for r in self.detections:
                 u, v = r["centroid_2d"]
@@ -293,6 +363,8 @@ class MapOrchestrator(Node):
                     valid = patch[(patch > 0.001) & (~np.isnan(patch)) &
                                   (~np.isinf(patch))]
                     d = float(np.median(valid)) if len(valid) > 0 else 0.0
+                    # Apply depth calibration scale
+                    d *= self._depth_scale
                 except Exception:
                     pass
 
@@ -308,7 +380,7 @@ class MapOrchestrator(Node):
                         if mx is not None:
                             pos = (mx, my, mz)
                         else:
-                            pos = (cam_x, cam_y, cam_z)  # fallback: camera frame
+                            pos = (cam_x, cam_y, cam_z)
                             self._log(f"  {r['class_name']}: no TF yet, "
                                       "using camera-frame position")
                     else:
@@ -316,33 +388,45 @@ class MapOrchestrator(Node):
                 else:
                     pos = (0.0, 0.0, 0.0)
 
-                id_key = (f"{r['class_name']}_{round(pos[0],2)}_"
-                          f"{round(pos[1],2)}_{round(pos[2],2)}")
-                self.seen_this_cycle.add(id_key)
+                # Crop RGB at bbox for CLIP embedding
+                x1, y1, x2, y2 = map(int, r["bbox_xyxy"])
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(w, x2), min(h, y2)
+                rgb_crop = cv2.cvtColor(frame_bgr[y1:y2, x1:x2], cv2.COLOR_BGR2RGB)
 
                 obs = dict(
                     camera="tb3", confidence=r["confidence"],
-                    timestamp=now, centroid_2d=(u, v), depth=d,
+                    timestamp=time.monotonic(), centroid_2d=(u, v), depth=d,
                     bbox_xyxy=r["bbox_xyxy"], frame=self.frame_count,
                 )
 
-                existing = self.db.get(id_key)
-                if existing:
-                    self.db.update(
-                        id_key, pos, timestamp=now,
-                        observation=obs, confidence=r["confidence"])
-                else:
-                    self.db.add(ObjectRecord(
-                        object_id=id_key, class_name=r["class_name"],
-                        position_world=pos, confidence=r["confidence"],
-                        timestamp=now, first_seen=now,
-                        observations=[obs],
-                        metadata={"source": "orchestrator"}))
+                # Add or update via CLIP-based re-identification
+                obj, action = self.db.add(
+                    rgb_crop=rgb_crop,
+                    class_name=r["class_name"],
+                    position_world=pos,
+                    confidence=r["confidence"],
+                    observation=obs,
+                )
+                self.seen_this_cycle.add(obj.object_id)
 
-            # Evict stale
-            for obj in list(self.db._objects.values()):
-                if obj.object_id not in self.seen_this_cycle:
-                    self.db.remove(obj.object_id)
+                if action == "new":
+                    self._log(f"  NEW: {obj.object_id} at ({pos[0]:.2f}, {pos[1]:.2f})")
+
+                # ── Drift monitoring ──
+                if self.tf_bridge.transform_available() and pos[2] != 0.0:
+                    try:
+                        cam_pose = self.tf_bridge.get_camera_pose()
+                        if cam_pose:
+                            drift_info = self.drift_monitor.observe(
+                                r["class_name"], cam_pose, pos)
+                            if drift_info:
+                                self._log(
+                                    f"Drift detected: {drift_info['mean_error_m']}m "
+                                    f"via '{r['class_name']}' "
+                                    f"({drift_info['observations']} observations)")
+                    except Exception:
+                        pass
 
         # ── Build display ──
         display = frame_bgr.copy()
@@ -367,62 +451,13 @@ class MapOrchestrator(Node):
                     (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
                     (255, 255, 255), 2)
 
-        # Save every 30 frames
+        # Save every 30 frames (quietly, no log)
         if self.frame_count % 30 == 0:
-            db_snap = self.db.get_all()
             p = os.path.join(self.output_dir,
                              f"frame_{self.frame_count:06d}.jpg")
             cv2.imwrite(p, display)
-            self._log(
-                f"[frame {self.frame_count}] FPS={self.fps_display:.1f}  "
-                f"det={len(self.detections)}  db={len(db_snap)} "
-                f"  → {p}")
 
     # ── Exploration ──────────────────────────────────────────────────────────
-
-    def exploration_tick(self):
-        """Periodic exploration logic: drive toward frontiers when idle."""
-        # Wait for SLAM to start building map + TF to be available
-        if self.current_map is None or not self.tf_bridge.transform_available():
-            return
-
-        # Publish initial pose once so AMCL can localize
-        self._publish_initial_pose_once()
-
-        # Don't start exploring until Nav2 is ready and we've had time to init
-        if not self._exploring_enabled:
-            if len(self.db.get_all()) > 0 or self.frame_count > 300:
-                self._exploring_enabled = True
-                self._log("Exploration enabled.")
-            return
-
-        # Skip if a goal is already active
-        if self._goal_active:
-            self._check_goal_result()
-            return
-
-        # If we found objects, stop exploring
-        if len(self.db.get_all()) > 0:
-            return
-
-        # Find and go to nearest frontier
-        goals = self.find_exploration_goals()
-        if not goals:
-            self._log("No reachable exploration goals found.")
-            return
-
-        cx, cy = goals[0]
-        self._log(f"Exploring toward frontier — goal at ({cx:.2f}, {cy:.2f})")
-
-        # Publish goal for RViz visualization
-        viz_pose = PoseStamped()
-        viz_pose.header.frame_id = "map"
-        viz_pose.header.stamp = self.get_clock().now().to_msg()
-        viz_pose.pose.position.x = cx
-        viz_pose.pose.position.y = cy
-        self._goal_viz_pub.publish(viz_pose)
-
-        self._send_nav_goal(cx, cy)
 
     def _check_goal_result(self):
         """Check if the active Nav2 goal has completed."""
@@ -560,6 +595,93 @@ class MapOrchestrator(Node):
         goals.sort(key=lambda c: c[0]**2 + c[1]**2)
         return goals
 
+    # ── Depth calibration ───────────────────────────────────────────────
+
+    def calibrate_depth(self, object_id: str,
+                        ground_truth_x: float, ground_truth_y: float) -> dict:
+        """Adjust depth calibration from a user-provided ground truth position.
+
+        Works by: look up the object's last raw observation (pixel + raw depth),
+        compute what depth WOULD have produced the given map-frame position,
+        derive scale = expected_depth / raw_depth, and blend into the running EMA.
+
+        Args:
+            object_id: Object identifier (e.g. 'chair_1').
+            ground_truth_x, ground_truth_y: Real/measured position in map frame.
+
+        Returns:
+            dict with {status, old_scale, new_scale, derived_correction, samples}.
+        """
+        obj = self.db.get(object_id)
+        if not obj:
+            return {"status": "error", "message": f"Object '{object_id}' not found."}
+
+        # Need the last observation's centroid + raw depth
+        last_obs = obj.observations[-1] if obj.observations else None
+        if not last_obs:
+            msg = (f"Object '{object_id}' has no observations with pixel data. "
+                   "Wait for a re-detection first.")
+            return {"status": "error", "message": msg}
+
+        u, v = last_obs.get("centroid_2d", (0, 0))
+
+        # Use the robot's current camera pose and the ground truth position
+        # to compute the expected range, then derive the depth correction.
+        import numpy as np
+        import math
+
+        robot_pose = self.tf_bridge.get_camera_pose() if hasattr(self, 'tf_bridge') and self.tf_bridge else None
+        if not robot_pose:
+            return {"status": "error", "message": "Robot pose not available for calibration."}
+
+        rx, ry, _ = robot_pose
+
+        # Ground truth vector from robot to object
+        dx_gt = ground_truth_x - rx
+        dy_gt = ground_truth_y - ry
+        expected_distance = math.sqrt(dx_gt*dx_gt + dy_gt*dy_gt)
+
+        # Object's current estimated distance (from stored position_world)
+        obj_x, obj_y = obj.position_world[0], obj.position_world[1]
+        current_dist = math.sqrt((obj_x - rx)**2 + (obj_y - ry)**2)
+
+        if current_dist < 0.01 or expected_distance < 0.01:
+            return {"status": "error",
+                    "message": f"Distances too small: current={current_dist:.2f}m, expected={expected_distance:.2f}m"}
+
+        # The correction: depth_scale should change by expected/current ratio
+        computed_scale = self._depth_scale * (expected_distance / current_dist)
+
+        # Sanity: clamp to [0.1, 10.0]
+        computed_scale = max(0.1, min(10.0, computed_scale))
+
+        old_scale = self._depth_scale
+        n = len(self._depth_scale_raw)
+
+        # Running median of calibration samples
+        self._depth_scale_raw.append(computed_scale)
+        if n > self._depth_scale_max_samples:
+            self._depth_scale_raw.pop(0)
+        # New scale = median of samples (robust to outliers)
+        self._depth_scale = float(np.median(self._depth_scale_raw))
+
+        self._log(
+            f"[Calibrate] '{object_id}': robot→obj "
+            f"current={current_dist:.2f}m, expected={expected_distance:.2f}m, "
+            f"correction={computed_scale:.3f}, "
+            f"scale: {old_scale:.3f} → {self._depth_scale:.3f} "
+            f"(median of {len(self._depth_scale_raw)} samples)")
+
+        return {
+            "status": "ok",
+            "old_scale": round(old_scale, 3),
+            "new_scale": round(self._depth_scale, 3),
+            "sample_correction": round(computed_scale, 3),
+            "samples": len(self._depth_scale_raw),
+            "current_distance": round(current_dist, 2),
+            "expected_distance": round(expected_distance, 2),
+        }
+
     # ── Cleanup ──
 
     def quit_callback(self):
@@ -585,14 +707,38 @@ class MapOrchestrator(Node):
 
 
 def main():
-    rclpy.init()
-    node = MapOrchestrator()
+    node = None
     try:
+        rclpy.init()
+        node = MapOrchestrator()
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
+    except SystemExit:
+        pass
+    except Exception as e:
+        print(f"\n[FATAL] Unhandled exception: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
     finally:
-        node.quit_callback()
+        if node is not None:
+            try:
+                node.quit_callback()
+            except Exception as e:
+                print(f"[Cleanup] Error during quit_callback: {e}", flush=True)
+        # Last-resort kill: clean up any remaining ROS 2 + background processes
+        print("[Cleanup] Final sweep: terminating any remaining subprocesses...")
+        try:
+            import subprocess
+            subprocess.run(
+                ["pkill", "-f", "slam_toolbox"],
+                capture_output=True, timeout=3)
+            subprocess.run(
+                ["pkill", "-f", "nav2_bringup"],
+                capture_output=True, timeout=3)
+        except Exception:
+            pass
+        print("[Cleanup] Done.")
 
 
 if __name__ == "__main__":

@@ -1,301 +1,502 @@
 """
-Object database (World Model): persistent storage of tracked objects.
+object_db.py — Persistent object database with CLIP-based re-identification.
 
-Stores every detected/identified object with:
-  - object_id (UUID, assigned by CrossCameraMatcher)
-  - class_name (from detector)
-  - 3D position (in world frame)
-  - observation history (list of (timestamp, camera, confidence, ...))
-  - metadata (color histogram, bounding boxes, etc.)
+Every detected object gets a unique human-readable ID (chair_1, chair_2, ...).
+Re-identification uses CLIP embedding cosine similarity, with position tiebreaker
+for visually identical objects (e.g. two identical chairs next to each other).
 
-The orchestrator queries this DB to answer:
-  "Where is the blue box right now?"
-  "What objects are within 0.5m of the arm end-effector?"
-  "Show me all cans detected in the last 30 seconds."
-
-Storage: in-memory dict with optional SQLite persistence.
+Objects persist for the entire run (or until explicitly forgotten). SQLite
+persistence saves object records + naming counters across restarts.
 """
+
 import json
 import time
-import uuid
 import sqlite3
+import numpy as np
 from dataclasses import dataclass, field, asdict
 from typing import Optional
-from collections import defaultdict
 
+
+# ── Defaults ───────────────────────────────────────────────────────────
+
+MATCH_THRESHOLD = 0.82
+AMBIGUITY_THRESHOLD = 0.65
+POSITION_TIEBREAKER_M = 0.5  # meters
+
+
+# ── Object record ──────────────────────────────────────────────────────
 
 @dataclass
 class ObjectRecord:
     """A single tracked object in the world model."""
-    object_id: str
-    class_name: str
-    position_world: tuple  # (x, y, z) in meters
-    confidence: float
-    timestamp: float  # last seen
-    first_seen: float
+    object_id: str            # "chair_1", "cup_3", etc.
+    class_name: str           # "chair", "cup", "table"
+    embedding: list = field(default_factory=list)  # 512-dim float list
+    description: str = ""     # lazy VLM description ("Red plastic chair")
+    position_world: tuple = (0.0, 0.0, 0.0)  # (x, y, z) meters
+    position_uncertainty: float = 0.0  # meters std
+    confidence: float = 0.0
+    first_seen: float = 0.0  # monotonic time
+    last_seen: float = 0.0   # monotonic time
     observations: list = field(default_factory=list)
-        # [{camera, confidence, timestamp, centroid_2d, depth, ...}]
-    color_histogram: list = field(default_factory=list)
+    obb_width: float = 0.0
+    obb_depth: float = 0.0
+    obb_height: float = 0.0
+    obb_angle: float = 0.0
+    mask_area: float = 0.0
+    point_count: int = 0
     metadata: dict = field(default_factory=dict)
 
+    # Convenience properties
     @property
     def age(self) -> float:
-        """Seconds since first seen."""
         return time.monotonic() - self.first_seen
 
     @property
     def age_last_seen(self) -> float:
-        """Seconds since last seen."""
-        return time.monotonic() - self.timestamp
+        return time.monotonic() - self.last_seen
 
-    def is_stale(self, timeout: float = 30.0) -> bool:
-        return self.age_last_seen > timeout
+    @property
+    def observation_count(self) -> int:
+        return len(self.observations)
 
+
+# ── Object database ────────────────────────────────────────────────────
 
 class ObjectDB:
-    """In-memory object database with optional SQLite persistence.
+    """"Persistent object database with CLIP-based re-identification.
 
-    Provides spatio-temporal querying of tracked objects.
+    Stores objects by class-indexed IDs (chair_1, chair_2...). Objects can only
+    be removed via forget_object/forget_class/forget_all — no stale eviction.
+    SQLite persistence is optional but recommended across restarts.
     """
 
     def __init__(
         self,
+        embedder=None,              # EmbeddingMatcher instance
         db_path: str = ":memory:",
-        stale_timeout: float = 30.0,
-        max_objects: int = 1000,
         persistence: bool = False,
+        match_threshold: float = MATCH_THRESHOLD,
+        ambiguity_threshold: float = AMBIGUITY_THRESHOLD,
+        position_tiebreaker_m: float = POSITION_TIEBREAKER_M,
     ):
         self._objects: dict[str, ObjectRecord] = {}
-        self._stale_timeout = stale_timeout
-        self._max_objects = max_objects
+        self._counters: dict[str, int] = {}  # class_name → next index
+        self._embedder = embedder
+        self._match_threshold = match_threshold
+        self._ambiguity_threshold = ambiguity_threshold
+        self._position_tiebreaker = position_tiebreaker_m
 
         if persistence and db_path != ":memory:":
-            self._persistence = persistence
+            self._persistence = True
             self._db_path = db_path
             self._init_db()
+            self._load_from_db()
 
     def _init_db(self):
         self._conn = sqlite3.connect(self._db_path)
-        self._conn.execute("""
-            CREATE TABLE IF NOT EXISTS objects (
-                id          TEXT PRIMARY KEY,
-                class_name  TEXT NOT NULL,
-                position    TEXT NOT NULL,   -- JSON: [x, y, z]
-                confidence  REAL,
-                timestamp   REAL,
-                first_seen  REAL,
-                observations TEXT,            -- JSON list
-                color_hist   TEXT,            -- JSON list
-                metadata     TEXT             -- JSON dict
-            )
-        """)
+        self._conn.execute("""CREATE TABLE IF NOT EXISTS objects (
+            id TEXT PRIMARY KEY,
+            class_name TEXT NOT NULL,
+            embedding TEXT,
+            description TEXT,
+            position TEXT,
+            uncertainty REAL,
+            confidence REAL,
+            first_seen REAL,
+            last_seen REAL,
+            observations TEXT,
+            obb_width REAL,
+            obb_depth REAL,
+            obb_height REAL,
+            obb_angle REAL,
+            mask_area REAL,
+            point_count INTEGER,
+            metadata TEXT
+        )""")
+        self._conn.execute("""CREATE TABLE IF NOT EXISTS counters (
+            class_name TEXT PRIMARY KEY,
+            next_index INTEGER NOT NULL
+        )""")
         self._conn.commit()
 
-    # ---- Core operations ----
+    # ── Naming ──────────────────────────────────────────────────────────
 
-    def add(self, obj: ObjectRecord) -> str:
-        """Upsert an object. Returns the object_id."""
-        self._objects[obj.object_id] = obj
-        if getattr(self, '_persistence', False):
-            self._persist(obj)
-        if len(self._objects) > self._max_objects:
-            self.evict_stale()
-        return obj.object_id
+    def _next_object_id(self, class_name: str) -> str:
+        """Return the next unique ID for this class, e.g. 'chair_3'."""
+        idx = self._counters.get(class_name, 0) + 1
+        self._counters[class_name] = idx
+        return f"{class_name}_{idx}"
 
-    def update(self, object_id: str, position: tuple, timestamp: float,
-               observation: dict = None, confidence: float = None):
-        """Update position and timestamp of an existing object.
+    # ── Core operations ────────────────────────────────────────────────
 
-        Merges: if the object was already in, adds a new observation and
-        updates position using an exponential moving average.
+    def add(self, rgb_crop: Optional[np.ndarray] = None,
+            class_name: str = "unknown",
+            position_world: tuple = (0.0, 0.0, 0.0),
+            confidence: float = 0.0,
+            timestamp: Optional[float] = None,
+            observation: Optional[dict] = None,
+            force_new: bool = False,
+            ) -> tuple[ObjectRecord, str]:
+        """Add a detection — either creates or updates an existing object.
+
+        If embedder is available, matches against existing objects of the same
+        class using CLIP visual embedding. If a match is found, updates the
+        existing record (position smoothing, append observation). Otherwise
+        creates a new named record.
+
+        Args:
+            rgb_crop: HxWx3 uint8 RGB image of the detection crop (for embedding).
+            class_name: Detector class label.
+            position_world: (x, y, z) in map frame.
+            confidence: Detection confidence.
+            timestamp: time.monotonic() value.
+            observation: Dict with detection metadata (bbox, depth, camera, etc.).
+            force_new: If True, skip matching and always create new record.
+
+        Returns:
+            (ObjectRecord, action) where action is "matched" | "new"
         """
+        if timestamp is None:
+            timestamp = time.monotonic()
+        if observation is None:
+            observation = {}
+
+        # Compute embedding if possible
+        embedding: Optional[np.ndarray] = None
+        if self._embedder is not None and rgb_crop is not None:
+            embedding = self._embedder.compute_embedding(rgb_crop)
+
+        # Try to match against existing objects of the same class
+        if not force_new and self._embedder is not None and embedding is not None:
+            candidates = []
+            for oid, obj in self._objects.items():
+                if obj.class_name == class_name and len(obj.embedding) == 512:
+                    stored_emb = np.array(obj.embedding, dtype=np.float32)
+                    candidates.append((oid, stored_emb, obj.position_world))
+
+            if candidates:
+                matched_id, sim, reason = self._embedder.match(
+                    embedding, candidates)
+
+                # Apply our own thresholds to the match result
+                if matched_id and sim >= self._match_threshold:
+                    is_same = True
+                elif matched_id and sim >= self._ambiguity_threshold:
+                    # Position tiebreaker
+                    obj = self._objects.get(matched_id)
+                    if obj:
+                        dist = np.linalg.norm(
+                            np.array(position_world[:2]) -
+                            np.array(obj.position_world[:2]))
+                        is_same = dist <= self._position_tiebreaker
+                    else:
+                        is_same = False
+                else:
+                    is_same = False
+
+                if is_same:
+                    # Update existing record
+                    self._update(matched_id, embedding, position_world,
+                                 confidence, timestamp, observation)
+                    return self._objects[matched_id], "matched"
+
+        # Create new record
+        oid = self._next_object_id(class_name)
+        obj = ObjectRecord(
+            object_id=oid,
+            class_name=class_name,
+            embedding=embedding.tolist() if embedding is not None else [],
+            position_world=position_world,
+            confidence=confidence,
+            first_seen=timestamp,
+            last_seen=timestamp,
+            observations=[observation],
+        )
+        self._objects[oid] = obj
+        self._persist(obj)
+        return obj, "new"
+
+    def _update(self, object_id: str, embedding: Optional[np.ndarray],
+                position: tuple, confidence: float,
+                timestamp: float, observation: dict):
+        """Update an existing record — position smoothing + embed blending."""
         obj = self._objects.get(object_id)
         if obj is None:
-            print(f"[ObjectDB] Object {object_id} not found, creating new.")
-            new_obj = ObjectRecord(
-                object_id=object_id,
-                class_name=observation.get("class_name", "unknown") if observation else "unknown",
-                position_world=position,
-                confidence=confidence or 0.0,
-                timestamp=timestamp,
-                first_seen=timestamp,
-            )
-            if observation:
-                new_obj.observations.append(observation)
-            self.add(new_obj)
             return
 
-        # Exponential moving average for position smoothing
-        alpha = 0.3
-        pos = np.array(position)
-        old_pos = np.array(obj.position_world)
-        smooth_pos = alpha * pos + (1 - alpha) * old_pos
-        obj.position_world = tuple(smooth_pos.tolist())
+        # Position smoothing (EMA alpha=0.3)
+        old_pos = np.array(obj.position_world, dtype=float)
+        new_pos = np.array(position, dtype=float)
+        if np.linalg.norm(new_pos - old_pos) < 5.0:  # sanity: don't blend if >5m jump
+            alpha = 0.3
+            smooth = alpha * new_pos + (1.0 - alpha) * old_pos
+            obj.position_world = tuple(smooth.tolist())
+        else:
+            obj.position_world = position
 
-        obj.timestamp = timestamp
-        if confidence is not None:
-            obj.confidence = confidence
+        # Embedding blending (slow EMA — new observations refine slowly)
+        if embedding is not None and len(obj.embedding) == 512:
+            old_emb = np.array(obj.embedding, dtype=np.float32)
+            alpha_emb = 0.15
+            blended = alpha_emb * embedding + (1.0 - alpha_emb) * old_emb
+            norm = np.linalg.norm(blended)
+            obj.embedding = (blended / norm).tolist() if norm > 0 else blended.tolist()
+
+        obj.confidence = confidence
+        obj.last_seen = timestamp
         if observation:
             obj.observations.append(observation)
+        self._persist(obj)
 
-        if getattr(self, '_persistence', False):
-            self._persist(obj)
+    # ── Retrieval ───────────────────────────────────────────────────────
 
     def get(self, object_id: str) -> Optional[ObjectRecord]:
         return self._objects.get(object_id)
 
-    def get_all(self, include_stale: bool = False) -> list[ObjectRecord]:
-        if include_stale:
-            return list(self._objects.values())
-        return [o for o in self._objects.values() if not o.is_stale(self._stale_timeout)]
+    def get_by_name(self, name: str) -> Optional[ObjectRecord]:
+        """Find object by its unique name (e.g. 'chair_1') or class prefix (e.g. 'chair')."""
+        # Exact match first
+        if name in self._objects:
+            return self._objects[name]
+        # Fuzzy by class name
+        for obj in self._objects.values():
+            if obj.object_id == name or obj.class_name == name:
+                return obj
+        return None
+
+    def get_all(self) -> list[ObjectRecord]:
+        return list(self._objects.values())
+
+    def get_by_class(self, class_name: str) -> list[ObjectRecord]:
+        """All objects matching a class (fuzzy substring)."""
+        return [o for o in self._objects.values()
+                if class_name.lower() in o.class_name.lower()]
 
     def has(self, object_id: str) -> bool:
         return object_id in self._objects
 
     def remove(self, object_id: str):
         self._objects.pop(object_id, None)
+        if getattr(self, '_persistence', False):
+            self._conn.execute("DELETE FROM objects WHERE id = ?", (object_id,))
+            self._conn.commit()
 
-    def evict_stale(self, timeout: float = None):
-        """Remove objects not seen in `timeout` seconds."""
-        if timeout is None:
-            timeout = self._stale_timeout
-        to_remove = [oid for oid, obj in self._objects.items() if obj.age_last_seen > timeout]
+    # ── Forgetting ──────────────────────────────────────────────────────
+
+    def forget_object(self, object_id: str) -> Optional[str]:
+        """Remove a single named object. Returns its name or None."""
+        obj = self._objects.pop(object_id, None)
+        if obj:
+            if getattr(self, '_persistence', False):
+                self._conn.execute("DELETE FROM objects WHERE id = ?", (object_id,))
+                self._conn.commit()
+            return object_id
+        return None
+
+    def forget_class(self, class_name: str) -> int:
+        """Remove all objects of a class. Returns count removed."""
+        to_remove = [oid for oid, obj in self._objects.items()
+                     if class_name.lower() in obj.class_name.lower()]
         for oid in to_remove:
             del self._objects[oid]
+        if getattr(self, '_persistence', False):
+            placeholders = ",".join("?" for _ in to_remove)
+            self._conn.execute(f"DELETE FROM objects WHERE id IN ({placeholders})", to_remove)
+            self._conn.commit()
+        return len(to_remove)
 
-    # ---- Spatial queries ----
+    def forget_all(self) -> int:
+        """Remove all objects. Returns count removed."""
+        count = len(self._objects)
+        self._objects.clear()
+        if getattr(self, '_persistence', False):
+            self._conn.execute("DELETE FROM objects")
+            self._conn.execute("DELETE FROM counters")
+            self._conn.commit()
+        return count
+
+    # ── Spatial queries ─────────────────────────────────────────────────
 
     def query_near(self, point: tuple, radius: float,
-                   class_filter: list = None) -> list[ObjectRecord]:
-        """All objects within `radius` meters of `point` in world frame."""
-        import numpy as np
-        pt = np.array(point)
+                   class_filter: Optional[list[str]] = None) -> list[ObjectRecord]:
+        pt = np.array(point[:2])  # 2D projection
         results = []
         for obj in self._objects.values():
-            pos = np.array(obj.position_world)
+            pos = np.array(obj.position_world[:2])
             if np.linalg.norm(pos - pt) <= radius:
                 if class_filter and obj.class_name not in class_filter:
                     continue
                 results.append(obj)
         return results
 
-    def query_by_class(self, class_name: str) -> list[ObjectRecord]:
-        """All objects with the given class_name (fuzzy match on substring)."""
-        return [o for o in self._objects.values()
-                if class_name.lower() in o.class_name.lower()]
-
-    def query_by_id(self, object_id: str) -> Optional[ObjectRecord]:
-        return self._objects.get(object_id)
-
     def nearest_to(self, point: tuple, class_filter: str = None,
                    max_results: int = 1) -> list[ObjectRecord]:
-        """Find the N nearest objects to a point, optionally filtered.
-
-        Useful for: "Which can should the arm pick up?" → find nearest can to TCP.
-        """
-        import numpy as np
-        pt = np.array(point)
+        pt = np.array(point[:2])
         candidates = list(self._objects.values())
         if class_filter:
-            candidates = [o for o in candidates if class_filter.lower() in o.class_name.lower()]
-        candidates.sort(key=lambda o: np.linalg.norm(np.array(o.position_world) - pt))
+            candidates = [o for o in candidates
+                          if class_filter.lower() in o.class_name.lower()]
+        candidates.sort(key=lambda o: np.linalg.norm(
+            np.array(o.position_world[:2]) - pt))
         return candidates[:max_results]
 
-    # ---- Temporal queries ----
+    # ── Temporal queries ────────────────────────────────────────────────
 
     def query_recent(self, seconds: float, class_filter: str = None) -> list[ObjectRecord]:
-        """Objects seen within the last `seconds`."""
         cutoff = time.monotonic() - seconds
-        results = [o for o in self._objects.values() if o.timestamp >= cutoff]
+        results = [o for o in self._objects.values() if o.last_seen >= cutoff]
         if class_filter:
-            results = [o for o in results if class_filter.lower() in o.class_name.lower()]
+            results = [o for o in results
+                       if class_filter.lower() in o.class_name.lower()]
         return results
 
-    # ---- Transform queries (needs TransformTree) ----
+    def query_history(self, class_name: str,
+                      minutes_ago: float = None) -> list[dict]:
+        now = time.monotonic()
+        results = []
+        for obj in self._objects.values():
+            if class_name.lower() not in obj.class_name.lower():
+                continue
+            for obs in obj.observations:
+                ts = obs.get("timestamp", 0)
+                if minutes_ago is not None and (now - ts) < minutes_ago * 60:
+                    continue
+                results.append({
+                    "object_id": obj.object_id,
+                    "class_name": obj.class_name,
+                    "timestamp": ts,
+                    "position": list(obj.position_world),
+                    "confidence": obs.get("confidence", 0),
+                })
+        return results
 
-    def query_near_frame(self, target_frame: str, source_frame: str,
-                         radius: float, tf_tree,
-                         class_filter: list = None) -> list[ObjectRecord]:
-        """Objects within `radius` of target_frame, expressed in source_frame.
+    def has_moved(self, object_id: str, threshold_m: float = 0.2) -> dict:
+        """Check if a specific named object has moved since its first observation."""
+        obj = self._objects.get(object_id)
+        if not obj:
+            return {"moved": False, "reason": f"Object '{object_id}' not found"}
+        if len(obj.observations) < 2:
+            return {"moved": False, "reason": "Only 1 observation, cannot determine movement",
+                    "observation_count": 1}
+        first_pos = np.array(obj.position_world)
+        last_pos = np.array(obj.position_world)
+        delta = float(np.linalg.norm(last_pos - first_pos))
+        return {
+            "object_id": obj.object_id,
+            "class_name": obj.class_name,
+            "moved": delta > threshold_m,
+            "delta_m": round(delta, 3),
+            "first_seen": obj.first_seen,
+            "observation_count": len(obj.observations),
+        }
 
-        This is KEY for the orchestrator:
-          "What objects are within 0.3m of the arm TCP?"
+    # ── Description generation ─────────────────────────────────────────
+
+    def describe_object(self, object_id: str,
+                        rgb_crop: np.ndarray = None) -> Optional[str]:
+        """Generate a short text description for an object.
+
+        Uses the LLM (via the robot's description pipeline) or falls back
+        to class_name + position. Stores the result in the record.
         """
-        import numpy as np
-        # Transform target_frame origin into world
-        T = tf_tree.lookup("world", target_frame)
-        target_in_world = tuple(T[:3, 3])
-
-        return self.query_near(target_in_world, radius, class_filter)
-
-    # ---- Persistence ----
-
-    def _persist(self, obj: ObjectRecord):
-        """Save object to SQLite."""
-        position = obj.position_world
-        if isinstance(position, np.ndarray):
-            position = position.tolist()
-
-        self._conn.execute("""
-            INSERT OR REPLACE INTO objects
-            (id, class_name, position, confidence, timestamp, first_seen,
-             observations, color_hist, metadata)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            obj.object_id,
-            obj.class_name,
-            json.dumps(position),
-            obj.confidence,
-            obj.timestamp,
-            obj.first_seen,
-            json.dumps(obj.observations),
-            json.dumps(obj.color_histogram if isinstance(obj.color_histogram, list) else obj.color_histogram.tolist()),
-            json.dumps(obj.metadata),
-        ))
-        self._conn.commit()
-
-    def load_from_db(self):
-        """Restore objects from SQLite."""
-        if not getattr(self, '_persistence', False):
-            return
-        rows = self._conn.execute("SELECT * FROM objects").fetchall()
-        for row in rows:
-            obj = ObjectRecord(
-                object_id=row[0],
-                class_name=row[1],
-                position_world=json.loads(row[2]),
-                confidence=row[3],
-                timestamp=row[4],
-                first_seen=row[5],
-                observations=json.loads(row[6]),
-                color_histogram=json.loads(row[7]) if row[7] else [],
-                metadata=json.loads(row[8]) if row[8] else {},
-            )
-            self._objects[obj.object_id] = obj
-
-    # ---- Diagnostics ----
+        obj = self._objects.get(object_id)
+        if not obj:
+            return None
+        # Fallback: just class name and position
+        desc = f"{obj.class_name} at {tuple(round(v, 2) for v in obj.position_world)}"
+        obj.description = desc
+        return desc
 
     def snapshot(self) -> dict:
-        """Return a full snapshot of the DB as a JSON-serializable dict."""
+        """JSON-serializable snapshot for the dashboard."""
         return {
             oid: {
                 "object_id": o.object_id,
                 "class_name": o.class_name,
-                "position_world": o.position_world,
+                "description": o.description or o.class_name,
+                "position_world": list(o.position_world),
                 "confidence": o.confidence,
-                "last_seen": o.timestamp,
-                "age_seconds": o.age_last_seen,
+                "last_seen": o.last_seen,
+                "first_seen": o.first_seen,
                 "observation_count": len(o.observations),
+                "uncertainty": o.position_uncertainty,
             }
             for oid, o in self._objects.items()
         }
+
+    # ── Persistence ─────────────────────────────────────────────────────
+
+    def _persist(self, obj: ObjectRecord):
+        if not getattr(self, '_persistence', False):
+            return
+        pos = obj.position_world
+        if isinstance(pos, np.ndarray):
+            pos = pos.tolist()
+        self._conn.execute("""INSERT OR REPLACE INTO objects
+            (id, class_name, embedding, description, position, uncertainty,
+             confidence, first_seen, last_seen, observations,
+             obb_width, obb_depth, obb_height, obb_angle,
+             mask_area, point_count, metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", (
+            obj.object_id,
+            obj.class_name,
+            json.dumps(obj.embedding),
+            obj.description,
+            json.dumps(pos),
+            obj.position_uncertainty,
+            obj.confidence,
+            obj.first_seen,
+            obj.last_seen,
+            json.dumps(obj.observations),
+            obj.obb_width, obj.obb_depth, obj.obb_height,
+            obj.obb_angle, obj.mask_area, obj.point_count,
+            json.dumps(obj.metadata),
+        ))
+        self._conn.commit()
+
+        # Save counters
+        for cls, idx in self._counters.items():
+            self._conn.execute(
+                "INSERT OR REPLACE INTO counters (class_name, next_index) VALUES (?, ?)",
+                (cls, idx))
+        self._conn.commit()
+
+    def _load_from_db(self):
+        """Restore objects and counters from SQLite."""
+        rows = self._conn.execute("SELECT * FROM objects").fetchall()
+        for row in rows:
+            embed_list = json.loads(row[2]) if row[2] else []
+            obj = ObjectRecord(
+                object_id=row[0],
+                class_name=row[1],
+                embedding=embed_list,
+                description=row[3] or "",
+                position_world=tuple(json.loads(row[4])),
+                position_uncertainty=row[5] or 0.0,
+                confidence=row[6] or 0.0,
+                first_seen=row[7] or 0.0,
+                last_seen=row[8] or 0.0,
+                observations=json.loads(row[9]) if row[9] else [],
+                obb_width=row[10] or 0.0,
+                obb_depth=row[11] or 0.0,
+                obb_height=row[12] or 0.0,
+                obb_angle=row[13] or 0.0,
+                mask_area=row[14] or 0.0,
+                point_count=row[15] or 0,
+                metadata=json.loads(row[16]) if row[16] else {},
+            )
+            self._objects[obj.object_id] = obj
+
+        # Load counters
+        crows = self._conn.execute("SELECT class_name, next_index FROM counters").fetchall()
+        for cls, idx in crows:
+            self._counters[cls] = idx
+
+    # ── Utils ───────────────────────────────────────────────────────────
 
     def __len__(self):
         return len(self._objects)
 
     def __repr__(self):
-        return f"ObjectDB(objects={len(self._objects)})"
-
-
-# Convenience: numpy is used inside spatial queries but imported lazily
-import numpy as np
+        return f"ObjectDB(objects={len(self._objects)}, classes={len(self._counters)})"
